@@ -1,0 +1,73 @@
+// Motorvezérlő lábak
+const int phasePin = 5;  // ESP D1 (Irány)
+const int enablePin = 4; // ESP D2 (Sebesség)
+
+// Enkóder lábak
+const int encoderPinA = 14; // ESP D5
+const int encoderPinB = 12; // ESP D6
+
+// Számláló változó
+volatile long encoderTicks = 0;
+
+// Megszakítás-kezelő függvény (minden egyes A-impulzusnál lefut)
+void IRAM_ATTR handleEncoder() {
+  if (digitalRead(encoderPinB) == HIGH) {
+    encoderTicks++;
+  } else {
+    encoderTicks--;
+  }
+}
+
+// Ékezetmentes méréskiíró függvény
+void meresKiirasa() {
+  noInterrupts();
+  long ticks = encoderTicks;
+  encoderTicks = 0; // Nullázás a következő másodpercre
+  interrupts();
+
+  Serial.print("Impulzus / sec: ");
+  Serial.println(ticks);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Motor lábak
+  pinMode(phasePin, OUTPUT);
+  pinMode(enablePin, OUTPUT);
+
+  // Enkóder lábak belső felhúzó-ellenállással
+  pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(encoderPinB, INPUT_PULLUP);
+
+  // Megszakítás aktiválása
+  attachInterrupt(digitalPinToInterrupt(encoderPinA), handleEncoder, RISING);
+}
+
+void loop() {
+  // --- 1. TESZT: FORGÁS ELŐRE ---
+  digitalWrite(phasePin, LOW);
+  analogWrite(enablePin, 700);
+  
+  for (int i = 0; i < 3; i++) {
+    delay(1000);
+    meresKiirasa(); // Módosított, ékezetmentes hívás
+  }
+
+  // STOP
+  analogWrite(enablePin, 0);
+  delay(1000);
+
+  // --- 2. TESZT: FORGÁS HÁTRA ---
+  digitalWrite(phasePin, HIGH);
+  analogWrite(enablePin, 700);
+
+  for (int i = 0; i < 3; i++) {
+    delay(1000);
+    meresKiirasa(); // Módosított, ékezetmentes hívás
+  }
+
+  // STOP
+  analogWrite(enablePin, 0);
+  delay(1000);
+}

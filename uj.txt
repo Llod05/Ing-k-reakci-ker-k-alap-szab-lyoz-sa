@@ -1,0 +1,114 @@
+
+const int phasePin = 5;   
+const int enablePin = 4;
+
+const int encoderPinA = 14;
+const int encoderPinB = 12;
+
+const int PWM_VALUE = 307;  // Kb. 30% (0-1023)
+const float COUNTS_PER_REV = 3840.0;
+
+volatile long encoderTicks = 0;
+volatile uint8_t previousState = 0;
+
+void IRAM_ATTR handleEncoder() {
+  uint8_t a = digitalRead(encoderPinA);
+  uint8_t b = digitalRead(encoderPinB);
+
+  uint8_t currentState = (a << 1) | b;
+  uint8_t transition = (previousState << 2) | currentState;
+
+  switch (transition) {
+    case 0b0001:
+    case 0b0111:
+    case 0b1110:
+    case 0b1000:
+      encoderTicks++;
+      break;
+
+    case 0b0010:
+    case 0b1011:
+    case 0b1101:
+    case 0b0100:
+      encoderTicks--;
+      break;
+  }
+
+  previousState = currentState;
+}
+
+void meresKiirasa() {
+  noInterrupts();
+  long ticks = encoderTicks;
+  encoderTicks = 0;
+  interrupts();
+
+  float rpm = (ticks / COUNTS_PER_REV) * 60.0;
+
+  Serial.print("Ticks/s: ");
+  Serial.print(ticks);
+
+  Serial.print(" | RPM: ");
+  Serial.println(rpm, 2);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(phasePin, OUTPUT);
+  pinMode(enablePin, OUTPUT);
+
+  analogWriteRange(1023);
+  analogWriteFreq(1000);
+
+  analogWrite(enablePin, 0);
+
+  pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(encoderPinB, INPUT_PULLUP);
+
+  previousState =
+    (digitalRead(encoderPinA) << 1) |
+    digitalRead(encoderPinB);
+
+  attachInterrupt(
+    digitalPinToInterrupt(encoderPinA),
+    handleEncoder,
+    CHANGE
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(encoderPinB),
+    handleEncoder,
+    CHANGE
+  );
+
+  Serial.println("Motor teszt indul");
+}
+
+void loop() {
+  // Elore
+  digitalWrite(phasePin, LOW);
+  analogWrite(enablePin, PWM_VALUE);
+
+  for (int i = 0; i < 3; i++) {
+    delay(1000);
+    meresKiirasa();
+  }
+
+  // Stop
+  analogWrite(enablePin, 0);
+  delay(1000);
+
+  // Hatra
+  digitalWrite(phasePin, HIGH);
+  analogWrite(enablePin, PWM_VALUE);
+
+  for (int i = 0; i < 3; i++) {
+    delay(1000);
+    meresKiirasa();
+  }
+
+  // Stop
+  analogWrite(enablePin, 0);
+  delay(1000);
+}

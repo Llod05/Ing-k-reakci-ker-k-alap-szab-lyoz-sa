@@ -1,0 +1,454 @@
+
+#include <Wire.h>
+#include <math.h>
+
+// -----------------------------
+// LABKIOSZTAS
+// -----------------------------
+
+// MPU6050
+const int SDA_PIN = D2;
+const int SCL_PIN = D1;
+const int MPU_ADDR = 0x68;
+
+// DRV8835
+const int motorDirPin = D7;
+const int motorPwmPin = D0;
+
+// FIT0450 enkoder
+const int encoderPinA = D5;
+const int encoderPinB = D6;
+
+// -----------------------------
+// MOTOR BEALLITASOK
+// -----------------------------
+
+const int PWM_MAX = 1023;
+const int PWM_VALUE = 1023;  // 30%
+
+const unsigned long FORWARD_TIME = 3000;
+const unsigned long STOP_TIME = 1000;
+const unsigned long REVERSE_TIME = 3000;
+
+int currentPWM = 0;
+
+unsigned long motorStateTime = 0;
+int motorState = 0;
+
+// 0 = elore
+// 1 = stop
+// 2 = hatra
+// 3 = stop
+
+// -----------------------------
+// ENKODER VALTOZOK
+// -----------------------------
+
+const float ENCODER_CPR = 3840.0;
+
+volatile long encoderTicks = 0;
+volatile uint8_t previousState = 0;
+
+long lastEncoderTicks = 0;
+
+// -----------------------------
+// IMU VALTOZOK
+// -----------------------------
+
+float gyro_z_offset = 0.0;
+float angle = 0.0;
+float initial_accel_angle = 0.0;
+
+unsigned long lastMeasureTime = 0;
+
+const unsigned long MEASURE_INTERVAL_US = 20000;
+
+// -----------------------------
+// X4 ENKODER
+// -----------------------------
+
+void IRAM_ATTR handleEncoder() {
+  uint8_t a = digitalRead(encoderPinA);
+  uint8_t b = digitalRead(encoderPinB);
+
+  uint8_t currentState = (a << 1) | b;
+  uint8_t transition =
+      (previousState << 2) | currentState;
+
+  switch (transition) {
+    case 0b0001:
+    case 0b0111:
+    case 0b1110:
+    case 0b1000:
+      encoderTicks++;
+      break;
+
+    case 0b0010:
+    case 0b1011:
+    case 0b1101:
+    case 0b0100:
+      encoderTicks--;
+      break;
+  }
+
+  previousState = currentState;
+}
+
+// -----------------------------
+// MOTOR VEZERLES
+// -----------------------------
+
+void setMotor(int pwmValue) {
+  pwmValue = constrain(
+      pwmValue, -PWM_MAX, PWM_MAX
+  );
+
+  if (pwmValue > 0) {
+    digitalWrite(motorDirPin, LOW);
+    analogWrite(motorPwmPin, pwmValue);
+  }
+  else if (pwmValue < 0) {
+    digitalWrite(motorDirPin, HIGH);
+    analogWrite(motorPwmPin, -pwmValue);
+  }
+  else {
+    analogWrite(motorPwmPin, 0);
+  }
+
+  currentPWM = pwmValue;
+}
+
+// -----------------------------
+// GIROSZKOP KALIBRACIO
+// -----------------------------
+
+bool calibrateGyro() {
+  long sum_z = 0;
+  int validSamples = 0;
+
+  for (int i = 0; i < 500; i++) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x43);
+
+    if (Wire.endTransmission(false) == 0 &&
+        Wire.requestFrom(MPU_ADDR, 6, true) == 6) {
+
+      Wire.read();
+      Wire.read();
+      Wire.read();
+      Wire.read();
+
+      int16_t gz = (int16_t)(
+          (Wire.read() << 8) | Wire.read()
+      );
+
+      sum_z += gz;
+      validSamples++;
+    }
+
+    delay(3);
+  }
+
+  if (validSamples == 0) {
+    return false;
+  }
+
+  gyro_z_offset =
+      sum_z / (float)validSamples;
+
+  return true;
+}
+
+// -----------------------------
+// KEZDETI SZOG KALIBRACIO
+// -----------------------------
+
+bool calibrateAngle() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom(MPU_ADDR, 6, true) != 6) {
+    return false;
+  }
+
+  int16_t ax = (int16_t)(
+      (Wire.read() << 8) | Wire.read()
+  );
+
+  int16_t ay = (int16_t)(
+      (Wire.read() << 8) | Wire.read()
+  );
+
+  Wire.read();
+  Wire.read();
+
+  initial_accel_angle =
+      atan2(ax, ay) * 180.0 / PI;
+
+  return true;
+}
+
+// -----------------------------
+// MOTOR TESZT CIKLUS
+// -----------------------------
+
+void updateMotor() {
+  unsigned long now = millis();
+
+  switch (motorState) {
+    case 0:
+      setMotor(PWM_VALUE);
+
+      if (now - motorStateTime >= FORWARD_TIME) {
+        setMotor(0);
+        motorState = 1;
+        motorStateTime = now;
+      }
+      break;
+
+    case 1:
+      if (now - motorStateTime >= STOP_TIME) {
+        setMotor(-PWM_VALUE);
+        motorState = 2;
+        motorStateTime = now;
+      }
+      break;
+
+    case 2:
+      if (now - motorStateTime >= REVERSE_TIME) {
+        setMotor(0);
+        motorState = 3;
+        motorStateTime = now;
+      }
+      break;
+
+    case 3:
+      if (now - motorStateTime >= STOP_TIME) {
+        setMotor(PWM_VALUE);
+        motorState = 0;
+        motorStateTime = now;
+      }
+      break;
+  }
+}
+
+// -----------------------------
+// IMU + ENKODER MERES
+// -----------------------------
+
+void updateMeasurements() {
+  unsigned long now = micros();
+
+  if (now - lastMeasureTime < MEASURE_INTERVAL_US) {
+    return;
+  }
+
+  float dt =
+      (now - lastMeasureTime) / 1000000.0;
+
+  lastMeasureTime = now;
+
+  if (dt <= 0.0) {
+    return;
+  }
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) {
+    setMotor(0);
+    return;
+  }
+
+  if (Wire.requestFrom(MPU_ADDR, 14, true) != 14) {
+    setMotor(0);
+    return;
+  }
+
+  int16_t ax = (int16_t)(
+      (Wire.read() << 8) | Wire.read()
+  );
+
+  int16_t ay = (int16_t)(
+      (Wire.read() << 8) | Wire.read()
+  );
+
+  int16_t az = (int16_t)(
+      (Wire.read() << 8) | Wire.read()
+  );
+
+  Wire.read();
+  Wire.read();
+
+  int16_t gx = (int16_t)(
+      (Wire.read() << 8) | Wire.read()
+  );
+
+  int16_t gy = (int16_t)(
+      (Wire.read() << 8) | Wire.read()
+  );
+
+  int16_t gz = (int16_t)(
+      (Wire.read() << 8) | Wire.read()
+  );
+
+  // Inga szogsebessege (fok/s)
+  float theta_dot =
+      (gz - gyro_z_offset) / 131.0;
+
+  // Inga szoge (fok)
+  float accel_angle =
+      atan2(ax, ay) * 180.0 / PI;
+
+  float relative_angle =
+      accel_angle - initial_accel_angle;
+
+  // Komplementer szuro
+  float alpha = 0.98;
+
+  angle =
+      alpha * (angle + theta_dot * dt) +
+      (1.0 - alpha) * relative_angle;
+
+  float theta = angle;
+
+  // Enkoder atomikus kiolvasasa
+  noInterrupts();
+  long currentTicks = encoderTicks;
+  interrupts();
+
+  long deltaTicks =
+      currentTicks - lastEncoderTicks;
+
+  lastEncoderTicks = currentTicks;
+
+  // Reakciokerek szogsebessege (fok/s)
+  float omega_R =
+      ((float)deltaTicks / ENCODER_CPR) *
+      360.0 / dt;
+
+  // Reakciokerek fordulatszama (RPM)
+  float rpm =
+      ((float)deltaTicks / ENCODER_CPR) *
+      60.0 / dt;
+
+  // PWM szazalek
+  float pwmPercent =
+      currentPWM * 100.0 / PWM_MAX;
+
+  // -----------------------------
+  // SERIAL MONITOR + PLOTTER
+  // -----------------------------
+
+  Serial.print("Theta:");
+  Serial.print(theta, 2);
+
+  Serial.print("\tTheta_dot:");
+  Serial.print(theta_dot, 2);
+
+  Serial.print("\tOmega_R:");
+  Serial.print(omega_R, 2);
+
+  Serial.print("\tRPM:");
+  Serial.print(rpm, 2);
+
+  Serial.print("\tTicks:");
+  Serial.print(currentTicks);
+
+  Serial.print("\tDeltaTicks:");
+  Serial.print(deltaTicks);
+
+  Serial.print("\tPWM:");
+  Serial.print(currentPWM);
+
+  Serial.print("\tPWM_percent:");
+  Serial.println(pwmPercent, 1);
+}
+
+// -----------------------------
+// SETUP
+// -----------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(motorDirPin, OUTPUT);
+  pinMode(motorPwmPin, OUTPUT);
+
+  analogWriteRange(PWM_MAX);
+  analogWriteFreq(1000);
+
+  setMotor(0);
+
+  pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(encoderPinB, INPUT_PULLUP);
+
+  previousState =
+      (digitalRead(encoderPinA) << 1) |
+      digitalRead(encoderPinB);
+
+  attachInterrupt(
+      digitalPinToInterrupt(encoderPinA),
+      handleEncoder,
+      CHANGE
+  );
+
+  attachInterrupt(
+      digitalPinToInterrupt(encoderPinB),
+      handleEncoder,
+      CHANGE
+  );
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+
+  if (Wire.endTransmission() != 0) {
+    Serial.println("HIBA: MPU nem valaszol!");
+
+    setMotor(0);
+
+    while (1) {
+      delay(100);
+    }
+  }
+
+  Serial.println("Kalibralas...");
+  Serial.println("Tartsd mozdulatlanul az ingat!");
+
+  if (!calibrateGyro() || !calibrateAngle()) {
+    Serial.println("HIBA: IMU kalibracio sikertelen!");
+    setMotor(0);
+
+    while (1) {
+      delay(100);
+    }
+  }
+
+  noInterrupts();
+  lastEncoderTicks = encoderTicks;
+  interrupts();
+
+  lastMeasureTime = micros();
+  motorStateTime = millis();
+
+  Serial.println("Meres indul!");
+}
+
+// -----------------------------
+// LOOP
+// -----------------------------
+
+void loop() {
+  updateMotor();
+  updateMeasurements();
+  yield();
+}

@@ -1,0 +1,170 @@
+#include <Wire.h>
+
+// --- LÁBKIOSZTÁS ---
+// IMU (MPU6050/9250) I2C lábak
+#define SDA_PIN D2 
+#define SCL_PIN D1 
+const int MPU_ADDR = 0x68;
+
+// Motorvezérlő lábak (ÚJ LÁBAK AZ ÜTKÖZÉS ELKERÜLÉSÉRE!)
+const int motorDirPin = D7;  // Irány (Phase)
+const int motorPwmPin = D8;  // Sebesség (Enable)
+
+// Enkóder lábak
+const int encoderPinA = 14; // ESP D5
+const int encoderPinB = 12; // ESP D6
+
+// --- VÁLTOZÓK ---
+// 1. IMU Változók
+float gyro_z_offset = 0;
+float angle = 0;          // Ez a theta
+float initial_accel_angle = 0;
+unsigned long last_time = 0;
+
+// 2. Enkóder Változók
+volatile long encoderTicks = 0;
+long lastEncoderTicks = 0;
+
+// ENKÓDER FELBONTÁS: 1 teljes fordulathoz (360 fok) tartozó impulzusok száma. 
+// Ezt a saját motorod adatlapja alapján kell beírnod! (Most egy példa érték)
+const float ENCODER_PPR = 341.2; 
+
+// --- MEGSZAKÍTÁS AZ ENKÓDERHEZ ---
+void IRAM_ATTR handleEncoder() {
+  if (digitalRead(encoderPinB) == HIGH) {
+    encoderTicks++;
+  } else {
+    encoderTicks--;
+  }
+}
+
+// --- IMU KALIBRÁCIÓ FUNKCIÓ ---
+void calibrateGyro() {
+  long sum_z = 0;
+  int samples = 500;
+  for (int i = 0; i < samples; i++) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x43);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 6, true);
+    if (Wire.available() == 6) {
+      Wire.read(); Wire.read(); // Gyro X
+      Wire.read(); Wire.read(); // Gyro Y
+      sum_z += (int16_t)(Wire.read() << 8 | Wire.read()); // Gyro Z
+    }
+    delay(3);
+  }
+  gyro_z_offset = sum_z / (float)samples;
+}
+
+// --- MOTOR VEZÉRLŐ FUNKCIÓ (A jövőbeli LQR algoritmushoz) ---
+void setMotor(int pwmValue) {
+  // A pwmValue értéke -1023 és +1023 között lehet ESP8266 esetén
+  if (pwmValue > 0) {
+    digitalWrite(motorDirPin, LOW);
+    analogWrite(motorPwmPin, pwmValue);
+  } else if (pwmValue < 0) {
+    digitalWrite(motorDirPin, HIGH);
+    analogWrite(motorPwmPin, -pwmValue);
+  } else {
+    analogWrite(motorPwmPin, 0);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Motor pinek beállítása
+  pinMode(motorDirPin, OUTPUT);
+  pinMode(motorPwmPin, OUTPUT);
+  setMotor(0); // Biztos, ami biztos, álljon a motor
+
+  // Enkóder beállítása
+  pinMode(encoderPinA, INPUT_PULLUP);
+  pinMode(encoderPinB, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(encoderPinA), handleEncoder, RISING);
+
+  // IMU beállítása
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);    
+  if (Wire.endTransmission() != 0) {
+    Serial.println("Hiba: MPU nem válaszol!");
+    while (1);
+  }
+
+  Serial.println("Kalibrálás... TÁMASZD LE AZ INGÁT MOZDULATLANUL!");
+  calibrateGyro();
+
+  // Bekapcsoláskori alaphelyzet
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 6, true);
+  if (Wire.available() == 6) {
+    int16_t raw_acc_x = (int16_t)(Wire.read() << 8 | Wire.read());
+    int16_t raw_acc_y = (int16_t)(Wire.read() << 8 | Wire.read());
+    int16_t raw_acc_z = (int16_t)(Wire.read() << 8 | Wire.read());
+    initial_accel_angle = atan2(raw_acc_x, raw_acc_y) * 180.0 / M_PI;
+  }
+
+  last_time = millis();
+  Serial.println("Indulás!");
+}
+
+void loop() {
+  // --- 1. IMU OLVASÁSA ---
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B); 
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 14, true);
+
+  if (Wire.available() == 14) {
+    int16_t raw_acc_x  = (int16_t)(Wire.read() << 8 | Wire.read());
+    int16_t raw_acc_y  = (int16_t)(Wire.read() << 8 | Wire.read());
+    int16_t raw_acc_z  = (int16_t)(Wire.read() << 8 | Wire.read());
+    Wire.read(); Wire.read(); 
+    int16_t raw_gyro_x = (int16_t)(Wire.read() << 8 | Wire.read());
+    int16_t raw_gyro_y = (int16_t)(Wire.read() << 8 | Wire.read());
+    int16_t raw_gyro_z = (int16_t)(Wire.read() << 8 | Wire.read());
+
+    unsigned long current_time = millis();
+    float dt = (current_time - last_time) / 1000.0; 
+    last_time = current_time;
+
+    // --- 2. ÁLLAPOTVEKTOR KISZÁMÍTÁSA ---
+    
+    // a) Theta_dot (Dőlés szögsebessége) [fok/s]
+    float theta_dot = (raw_gyro_z - gyro_z_offset) / 131.0;
+
+    // b) Theta (Dőlésszög) [fok]
+    float current_accel_angle = atan2(raw_acc_x, raw_acc_y) * 180.0 / M_PI;
+    float relative_accel_angle = current_accel_angle - initial_accel_angle;
+    angle = 0.98 * (angle + theta_dot * dt) + 0.02 * relative_accel_angle;
+    float theta = angle;
+
+    // c) Omega_R (Reakciókerék relatív szögsebessége) [fok/s]
+    noInterrupts();
+    long currentTicks = encoderTicks;
+    interrupts();
+    long deltaTicks = currentTicks - lastEncoderTicks;
+    lastEncoderTicks = currentTicks;
+    float omega_R = ((float)deltaTicks / ENCODER_PPR) * 360.0 / dt;
+
+    // --- 3. KIÍRÁS A SOROS PLOTTERHEZ ---
+    // (A formátum direkt ilyen, hogy a Serial Plotter grafikonként tudja rajzolni)
+    Serial.print("Theta:");
+    Serial.print(theta);
+    Serial.print(" Theta_dot:");
+    Serial.print(theta_dot);
+    Serial.print(" Omega_R:");
+    Serial.println(omega_R);
+
+    // Később ide jön az LQR számítás, és a végén pl: setMotor(kiszamolt_pwm);
+  }
+
+  delay(20);
+}
